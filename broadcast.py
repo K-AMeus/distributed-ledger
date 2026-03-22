@@ -16,11 +16,11 @@ def broadcast_transaction(h: str, content: str):
         http_post(f"http://{peer}/inv", {"hash": h, "content": content})
 
 
-def broadcast_block(h: str, content: str):
+def broadcast_block(h: str, content: str, prev_hash: str):
     """Send a new block to all known peers."""
     with state.lock:
         current_peers = list(state.peers)
 
     for peer in current_peers:
         print(f"  [→] sending block {h[:8]}... → {peer}")
-        http_post(f"http://{peer}/block", {"hash": h, "content": content})
+        http_post(f"http://{peer}/block", {"hash": h, "content": content, "prev_hash": prev_hash})

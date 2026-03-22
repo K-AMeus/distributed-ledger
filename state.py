@@ -11,6 +11,7 @@ import threading
 # ── Identity ────────────────────────────────────────────────
 # Set once at startup from the command line argument.
 MY_PORT: int = None
+MY_IP: str = "127.0.0.1"
 
 # ── Network ─────────────────────────────────────────────────
 # Set of peer addresses this node knows about.
@@ -37,4 +38,4 @@ lock = threading.Lock()
 
 def my_addr() -> str:
     """Returns this node's own address in ip:port format."""
-    return f"127.0.0.1:{MY_PORT}"
+    return f"{MY_IP}:{MY_PORT}"

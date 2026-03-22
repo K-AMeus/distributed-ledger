@@ -10,6 +10,7 @@ Endpoints:
     POST /block             → receive a new block
 """
 
+import hashlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -101,6 +102,12 @@ class NodeHandler(BaseHTTPRequestHandler):
             if not h or not content:
                 self.send_json({"errcode": 2, "errmsg": "missing hash or content"}, 400)
                 return
+            
+            content_str = json.dumps(content, sort_keys=True) if isinstance(content, dict) else str(content)
+            expected = hashlib.sha256(content_str.encode()).hexdigest()
+            if expected != h:
+                self.send_json({"errcode": 3, "errmsg": f"hash mismatch, expected {expected}"}, 400)
+                return
 
             with state.lock:
                 if h in state.transactions:
@@ -129,17 +136,43 @@ class NodeHandler(BaseHTTPRequestHandler):
 
             with state.lock:
                 if h in state.blocks:
-                    self.send_json({"status": "already known"})
+                    self.send_json({"errcode": 1, "errmsg": "already known"})
                     return
-                state.blocks[h] = content
 
-            print(f"  [new block] {h[:8]}... : {content}")
+                # Check all transactions exist in mempool
+                tx_list = content.get("transactions", [])
+                for tx in tx_list:
+                    tx_hash = hashlib.sha256(json.dumps(tx, sort_keys=True).encode()).hexdigest()
+                    if tx_hash not in state.transactions:
+                        self.send_json({"errcode": 4, "errmsg": f"unknown transaction {tx_hash[:8]}"}, 400)
+                        return
+
+                # Get previous block hash (last block in chain)
+                prev_hash = data.get("prev_hash") or (list(state.blocks.keys())[-1] if state.blocks else "0" * 64)
+
+                # Recompute hash using content + prev_hash
+                chain_content = {"content": content, "prev_hash": prev_hash}
+                chain_str = json.dumps(chain_content, sort_keys=True)
+                expected = hashlib.sha256(chain_str.encode()).hexdigest()
+                if expected != h:
+                    self.send_json({"errcode": 3, "errmsg": f"hash mismatch, expected {expected}"}, 400)
+                    return
+
+                state.blocks[h] = {"content": content, "prev_hash": prev_hash}
+
+                # Clear confirmed transactions from mempool
+                for tx in tx_list:
+                    tx_hash = hashlib.sha256(json.dumps(tx, sort_keys=True).encode()).hexdigest()
+                    state.transactions.pop(tx_hash, None)
+                    print(f"  [mempool] confirmed tx {tx_hash[:8]}...")
+
+            print(f"  [new block] {h[:8]}... with {len(tx_list)} transactions")
             self.send_json(1)
 
             # Forward to peers in background
             threading.Thread(
                 target=broadcast.broadcast_block,
-                args=(h, content),
+                args=(h, content, prev_hash),
                 daemon=True
             ).start()
 

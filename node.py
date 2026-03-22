@@ -21,9 +21,11 @@ import server
 
 def startup_tasks():
     """Run peer discovery and block sync after server has started."""
-    time.sleep(1)  # Wait for server to be ready
-    discovery.discover_peers()
-    discovery.sync_blocks()
+    while True:
+        time.sleep(1)  # Wait for server to be ready
+        discovery.discover_peers()
+        discovery.sync_blocks()
+        time.sleep(10)
 
 
 def main():
@@ -33,7 +35,9 @@ def main():
 
     # Set this node's port
     state.MY_PORT = int(sys.argv[1])
-    config_file = sys.argv[2] if len(sys.argv) > 2 else "network.json"
+    
+    state.MY_IP = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    config_file = sys.argv[3] if len(sys.argv) > 3 else "network.json"
 
     # Load config (initial peers)
     config.load_config(config_file)
