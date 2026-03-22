@@ -1,4 +1,4 @@
-# ITI0215_26 — Hajusandmebaas / P2P sõlm
+# ITI0215_26 — P2P Rakendus
 
 ## Käivitamine
 
@@ -241,18 +241,3 @@ Blokkide ja tehingute edastamine toimub flood-meetodil — iga sõlm saadab saad
 | 3 uue sõlme lisamine | Sünkisid kõik plokid ~10s jooksul |
 | Stressitest (50 tehingut) | ~1400–1800 tehingut/sek |
 | Maksimaalselt testitud sõlmi | 8 korraga |
-
-### Mitme masinaga katse
-
-Testitud kahel masinal samas võrgus:
-- Masin A: 192.168.1.10, sõlmed pordil 5001 ja 5002
-- Masin B: 192.168.1.15, sõlm pordil 5001
-
-Masin B käivitati:
-```bash
-python node.py 5001 192.168.1.15
-```
-
-Masin B `network.json` osutas masin A bootstrap sõlmele (`192.168.1.10:5001`).
-
-Tulemus: Masin B sõlm leidis masin A sõlmed ~10s jooksul ja sünkis kõik plokid edukalt.
