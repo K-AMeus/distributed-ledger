@@ -1,107 +1,189 @@
-#!/usr/bin/env python3
+"""
+server.py — HTTP server and request handlers for all endpoints.
 
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.parse as urlparse
-import sys
+Endpoints:
+    GET  /addr              → return list of known peers
+    GET  /getblocks         → return list of all block hashes
+    GET  /getblocks/<hash>  → return block hashes after a given hash
+    GET  /getdata/<hash>    → return a single block's content
+    POST /inv               → receive a new transaction
+    POST /block             → receive a new block
+"""
+
+import hashlib
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import state
+import broadcast
 
 
+class NodeHandler(BaseHTTPRequestHandler):
 
-known_addresses = [
-    {"host": "127.0.0.1", "port": 8000},
-    {"host": "127.0.0.1", "port": 8001},
-    {"host": "127.0.0.1", "port": 8003},
-]
+    def log_message(self, format, *args):
+        """Override default logging to keep output clean."""
+        print(f"  [←] {self.client_address[0]} {args[0]}")
 
-def get_known_addresses():
-    return known_addresses;
+    def send_json(self, data, status=200):
+        """Helper to send a JSON response."""
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
 
+    # ----------------------------------------------------------
+    # GET handlers
+    # ----------------------------------------------------------
 
-class MyHandler(BaseHTTPRequestHandler):
-    def do_GET(self): 
+    def do_GET(self):
+        path = self.path
 
-        parsed = urlparse.urlparse(self.path)      
+        # GET /addr — return known peers
+        if path == "/addr":
+            with state.lock:
+                result = list(state.peers)
+            self.send_json(result)
 
-        is_ok = True
+        # GET /getblocks — return all block hashes
+        elif path == "/getblocks":
+            with state.lock:
+                result = list(state.blocks.keys())
+            self.send_json(result)
 
-        if parsed.path == "/addr":
-            result = get_known_addresses()
-            result = ",".join([f"{addr['host']}:{addr['port']}" for addr in result])
+        # GET /getblocks/<hash> — return block hashes after given hash
+        elif path.startswith("/getblocks/"):
+            since_hash = path[len("/getblocks/"):]
+            with state.lock:
+                all_hashes = list(state.blocks.keys())
+            if since_hash in all_hashes:
+                idx = all_hashes.index(since_hash)
+                result = all_hashes[idx + 1:]
+            else:
+                result = all_hashes
+            self.send_json(result)
+
+        # GET /getdata/<hash> — return a single block's content
+        elif path.startswith("/getdata/"):
+            h = path[len("/getdata/"):]
+            with state.lock:
+                block = state.blocks.get(h)
+            if block is not None:
+                self.send_json({"hash": h, "content": block})
+            else:
+                self.send_json({"error": "block not found"}, 404)
+
         else:
-            is_ok = False
-            self.send_response(404)
-            self.end_headers()
-            return
+            self.send_json({"error": "unknown endpoint"}, 404)
 
-        if is_ok:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(result.encode("utf-8"))
-
-
+    # ----------------------------------------------------------
+    # POST handlers
+    # ----------------------------------------------------------
 
     def do_POST(self):
-        content_length_str = self.headers.get("Content-Length")
-        if content_length_str is None:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"Content-Length header is missing")
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode()
+
+        try:
+            data = json.loads(body)
+        except Exception:
+            self.send_json({"errcode": 1, "errmsg": "invalid JSON"}, 400)
             return
 
-        content_length = int(content_length_str)
-        rawdata = self.rfile.read(content_length)
-        body = rawdata.decode("utf-8")
+        path = self.path
 
-        if self.path == "/addr":
-            try:
-                data = json.loads(body)
-            except json.JSONDecodeError:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b"Invalid JSON")
+        # POST /inv — receive a new transaction
+        if path == "/inv":
+            h = data.get("hash")
+            content = data.get("content")
+
+            if not h or not content:
+                self.send_json({"errcode": 2, "errmsg": "missing hash or content"}, 400)
+                return
+            
+            content_str = json.dumps(content, sort_keys=True) if isinstance(content, dict) else str(content)
+            expected = hashlib.sha256(content_str.encode()).hexdigest()
+            if expected != h:
+                self.send_json({"errcode": 3, "errmsg": f"hash mismatch, expected {expected}"}, 400)
                 return
 
-            host = data.get("host")
-            port = data.get("port")
+            with state.lock:
+                if h in state.transactions:
+                    self.send_json({"status": "already known"})
+                    return
+                state.transactions[h] = content
 
-            if not host or not port:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b'Missing "host" or "port"')
+            print(f"  [new transaction] {h[:8]}... : {content}")
+            self.send_json(1)
+
+            # Forward to peers in background
+            threading.Thread(
+                target=broadcast.broadcast_transaction,
+                args=(h, content),
+                daemon=True
+            ).start()
+
+        # POST /block — receive a new block
+        elif path == "/block":
+            h = data.get("hash")
+            content = data.get("content")
+
+            if not h or not content:
+                self.send_json({"errcode": 2, "errmsg": "missing hash or content"}, 400)
                 return
 
-            peer = {"host": host, "port": int(port)}
+            with state.lock:
+                if h in state.blocks:
+                    self.send_json({"errcode": 1, "errmsg": "already known"})
+                    return
 
-            if peer not in known_addresses:
-                known_addresses.append(peer)
+                # Check all transactions exist in mempool
+                tx_list = content.get("transactions", [])
+                for tx in tx_list:
+                    tx_hash = hashlib.sha256(json.dumps(tx, sort_keys=True).encode()).hexdigest()
+                    if tx_hash not in state.transactions:
+                        self.send_json({"errcode": 4, "errmsg": f"unknown transaction {tx_hash[:8]}"}, 400)
+                        return
 
-            out = json.dumps({
-                "ok": True,
-                "known_addresses": known_addresses
-            })
+                # Get previous block hash (last block in chain)
+                prev_hash = data.get("prev_hash") or (list(state.blocks.keys())[-1] if state.blocks else "0" * 64)
 
-            self.send_response(200)
-            self.send_header("Content-type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(out.encode("utf-8"))
-            return
+                # Recompute hash using content + prev_hash
+                chain_content = {"content": content, "prev_hash": prev_hash}
+                chain_str = json.dumps(chain_content, sort_keys=True)
+                expected = hashlib.sha256(chain_str.encode()).hexdigest()
+                if expected != h:
+                    self.send_json({"errcode": 3, "errmsg": f"hash mismatch, expected {expected}"}, 400)
+                    return
+
+                state.blocks[h] = {"content": content, "prev_hash": prev_hash}
+
+                # Clear confirmed transactions from mempool
+                for tx in tx_list:
+                    tx_hash = hashlib.sha256(json.dumps(tx, sort_keys=True).encode()).hexdigest()
+                    state.transactions.pop(tx_hash, None)
+                    print(f"  [mempool] confirmed tx {tx_hash[:8]}...")
+
+            print(f"  [new block] {h[:8]}... with {len(tx_list)} transactions")
+            self.send_json(1)
+
+            # Forward to peers in background
+            threading.Thread(
+                target=broadcast.broadcast_block,
+                args=(h, content, prev_hash),
+                daemon=True
+            ).start()
+
+        else:
+            self.send_json({"error": "unknown endpoint"}, 404)
 
 
-
-if __name__ == "__main__":
-
-    if len(sys.argv) < 2:
-        print("\nUsage: ./server.py <port>\n")
-        sys.exit(1)
-
-    port = int(sys.argv[1])
-
-    if port < 2000 or port > 65535:
-        print("Port number must be between 1024 and 65535")
-        sys.exit(1)
-
-
-    server = HTTPServer(("", port), MyHandler)
-    print(f"Server started on {port}")
+def run_server(port: int):
+    """Start the HTTP server on the given port."""
+    server = HTTPServer(("0.0.0.0", port), NodeHandler)
+    print(f"\n[server] node started on port {port}")
+    print(f"[server] listening on http://0.0.0.0:{port}")
+    print("[server] press Ctrl+C to stop\n")
     server.serve_forever()
