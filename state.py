@@ -94,17 +94,30 @@ def add_block(h: str, content: dict, prev_hash: str) -> bool:
     return False
 
 
-def adopt_chain(hashes: list) -> bool:
+def adopt_chain(hashes: list, allow_equal: bool = False) -> bool:
     """
-    Replace the canonical chain with the given list of hashes if:
-      - all hashes are present in block_store, AND
-      - the new chain is strictly longer than the current one.
+    Replace the canonical chain with the given list of hashes if all hashes
+    are present in block_store and either:
+      - the new chain is strictly longer than the current one, OR
+      - allow_equal=True and the new chain has the same length but a
+        lexicographically smaller tip hash (tie-breaking rule).
     Caller must hold state.lock. Returns True if adopted.
     """
     global blocks
 
-    if len(hashes) <= chain_height():
+    new_len = len(hashes)
+    cur_len = chain_height()
+
+    if new_len < cur_len:
         return False
+    if new_len == cur_len:
+        if not allow_equal:
+            return False
+        # Tie-break: only replace if new tip is lexicographically smaller
+        new_tip = hashes[-1]
+        our_tip = chain_tip() or ""
+        if new_tip >= our_tip:
+            return False
 
     new_blocks = {}
     for h in hashes:

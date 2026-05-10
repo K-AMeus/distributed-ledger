@@ -22,13 +22,13 @@ import consensus
 
 
 def background_loop():
-    """Peer discovery + block sync + consensus, repeated every 10 s."""
+    """Peer discovery + block sync + consensus, repeated every 5 s."""
     time.sleep(1)  # Let the HTTP server start first
     while True:
         discovery.discover_peers()
         discovery.sync_blocks()
         consensus.run_consensus_round()
-        time.sleep(10)
+        time.sleep(5)
 
 
 def main():

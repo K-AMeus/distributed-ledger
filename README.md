@@ -27,7 +27,7 @@ python node.py 5001 192.168.1.10
 
 Divergentsi ja konsensuse demo (soovituslik):
 ```bash
-python demo_divergence.py
+python demo.py
 ```
 
 Vana põhiline võrgutesti skript:
@@ -272,7 +272,7 @@ Iga sõlm laeb algul peers'id `network.json` failist. Käivitumisel teeb BFS ots
 
 ## Demo tulemused
 
-### demo_divergence.py
+### demo.py
 
 **Osa 1 — Divergentsi loomine**
 
@@ -301,5 +301,5 @@ Lõpptulemus: kõik kolm sõlme leppisid kokku täpselt samas ketis.
 
 ### Piirangud
 
-- **Võrdse pikkuse viik:** kaks võrdse pikkusega konkureerivat ketti ei lahene automaatselt. Lahendus (implementeerimata): kui pikkused võrdsed, eelistada väiksema tip-hashiga ketti (deterministlik, ei nõua lisasuhtlust).
+- **Võrdse pikkuse viik:** kui kaks ketti on täpselt sama pikad, eelistab konsensusalgoritm väiksema tip-hashiga ketti (deterministlik, ei nõua lisasuhtlust). See on implementeeritud `consensus.py` funktsioonides `sync_from_peer` ja `state.adopt_chain(allow_equal=True)`.
 - **Plokkide saatmine peers'idele:** `/block` endpoint nõuab et tehingud oleksid mempoolil — sünkimisel kasutatakse seetõttu otse `/getdata` (mempooli kontroll möödutakse).

@@ -1,20 +1,10 @@
 """
 demo.py -- Full demonstration: divergence + consensus.
 
-PART 1 -- Task 1: reproduce the exact assignment scenario
-  S1 sends T1 to S2 (not S3)
-  S2 sends T2 to S3 (not S1)
-  S3 sends T3 to S1 (not S2)
-  Result: S1=(T1,T3)  S2=(T1,T2)  S3=(T2,T3)
-  Each node mines a block -> three incompatible height-1 chains (divergence).
-
-PART 2 -- Task 2a: equal-length tie, consensus CANNOT resolve
-  Nodes are connected. All chains are height=1.
-  Longest-chain rule needs a STRICTLY longer chain, so nobody switches.
-
-PART 3 -- Task 2b: one chain grows longer, consensus SUCCEEDS
-  S1 receives a new transaction and mines a second block (height=2).
-  S2 and S3 detect the longer chain and adopt it -> all nodes agree.
+PART 1 -- Create divergent ledgers (no consensus)
+PART 2 -- Equal-length tie: consensus fails then resolves via tie-break
+PART 3 -- Longer chain wins: consensus succeeds
+PART 4 -- Rapid concurrent mining: consensus cannot keep up
 
 Run:
     python demo.py
@@ -25,12 +15,42 @@ import json
 import subprocess
 import sys
 import time
+import threading
 from urllib.request import urlopen, Request
 
 PORTS = [5001, 5002, 5003]
 NAMES = ["S1", "S2", "S3"]
 procs = {}
 GENESIS = "0" * 64
+
+W = 62  # output width
+
+
+# -- Formatting helpers --------------------------------------------------------
+
+def banner(title):
+    print(f"\n{'█' * W}")
+    print(f"  {title}")
+    print(f"{'█' * W}")
+
+
+def section(title):
+    print(f"\n  ┌{'─' * (W - 4)}┐")
+    print(f"  │ {title:<{W - 5}}│")
+    print(f"  └{'─' * (W - 4)}┘")
+
+
+def result_pass(msg):
+    print(f"\n  ✓ RESULT: {msg}")
+
+
+def result_fail(msg):
+    print(f"\n  ✗ RESULT: {msg}")
+
+
+def wait_msg(seconds):
+    print(f"\n  ⏳ Waiting {seconds}s for consensus round...")
+    time.sleep(seconds)
 
 
 # -- HTTP helpers --------------------------------------------------------------
@@ -79,7 +99,18 @@ def block_hash(content, prev_hash):
 
 # -- Node helpers --------------------------------------------------------------
 
+def kill_port(port):
+    """Kill any process currently listening on this TCP port (Linux/macOS)."""
+    subprocess.run(
+        ["fuser", "-k", f"{port}/tcp"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.3)
+
+
 def start_node(port):
+    kill_port(port)
     p = subprocess.Popen(
         [sys.executable, "node.py", str(port), "127.0.0.1", "nonexistent.json"],
         stdout=subprocess.DEVNULL,
@@ -87,14 +118,17 @@ def start_node(port):
     )
     procs[port] = p
     if not wait_for_server(port):
-        print(f"  WARNING: node :{port} did not respond within 10 s")
+        print(f"  ⚠  node :{port} did not respond within 10s")
 
 
 def stop_all():
     for p in procs.values():
         p.terminate()
     procs.clear()
-    print("  [cleanup] all nodes stopped.")
+    time.sleep(0.5)
+    for port in PORTS:
+        kill_port(port)
+    print("  All nodes stopped.")
 
 
 def add_peer(port, peer_port):
@@ -144,26 +178,31 @@ def mine_block(port, prev_hash=None):
 
 # -- Reporting -----------------------------------------------------------------
 
-def print_mempools(label=""):
-    if label:
-        print(f"\n{'-'*62}\n  {label}\n{'-'*62}")
+def print_mempools():
     for i, port in enumerate(PORTS):
         txs = http_get(port, "/mempool") or []
-        print(f"  {NAMES[i]} (:{port}) mempool ({len(txs)} tx):")
-        for tx in txs:
-            print(f"    {tx}")
+        items = ", ".join(f"{t['sender']}→{t['receiver']}" for t in txs)
+        print(f"    {NAMES[i]}  [{len(txs)} tx]  {items}")
 
 
-def print_chains(label=""):
-    if label:
-        print(f"\n{'-'*62}\n  {label}\n{'-'*62}")
+def print_chains():
     for i, port in enumerate(PORTS):
         s = http_get(port, "/status") or {}
-        tip = (s.get("chain_tip") or "none")[:16] + "..."
+        h = s.get("chain_height", 0)
+        tip = (s.get("chain_tip") or "none")[:16]
         chain = s.get("chain", [])
-        print(f"  {NAMES[i]} (:{port})  height={s.get('chain_height', 0)}  store={s.get('block_store_size', 0)}  tip={tip}")
-        for j, bh in enumerate(chain):
-            print(f"           block[{j}] = {bh[:24]}...")
+        blocks_str = " → ".join(bh[:10] for bh in chain) if chain else "(empty)"
+        print(f"    {NAMES[i]}  height={h}  tip={tip}…")
+        print(f"         {blocks_str}")
+
+
+def print_chains_compact():
+    for i, port in enumerate(PORTS):
+        s = http_get(port, "/status") or {}
+        h = s.get("chain_height", 0)
+        tip = (s.get("chain_tip") or "?")[:12]
+        st = s.get("block_store_size", 0)
+        print(f"    {NAMES[i]}  height={h}  tip={tip}…  store={st}")
 
 
 def all_agree():
@@ -172,188 +211,299 @@ def all_agree():
 
 
 # =============================================================================
-# PART 1 -- Task 1: create divergent ledgers (exact assignment scenario)
+# PART 1 -- Create divergent ledgers
 # =============================================================================
 
-print("\n" + "=" * 62)
-print("  PART 1 -- Task 1: create divergent ledgers")
-print("=" * 62)
-print("""
-  Assignment scenario:
-    S1 sends T1 to S2 (not S3)
-    S2 sends T2 to S3 (not S1)
-    S3 sends T3 to S1 (not S2)
+banner("PART 1 — Create divergent ledgers (no consensus)")
 
-  Expected mempools:
-    S1: (T1, T3)    S2: (T1, T2)    S3: (T2, T3)
+print("""
+  Scenario (from assignment):
+    S1 sends T1 to S2 only       S2 sends T2 to S3 only
+    S3 sends T3 to S1 only
+
+  Expected result:
+    S1: {T1, T3}    S2: {T1, T2}    S3: {T2, T3}
 """)
 
-print("  Starting 3 isolated nodes (no peers)...")
+section("Starting 3 isolated nodes")
 for port in PORTS:
     start_node(port)
-print(f"  Nodes: S1=:{PORTS[0]}  S2=:{PORTS[1]}  S3=:{PORTS[2]}\n")
+print(f"    S1=:{PORTS[0]}   S2=:{PORTS[1]}   S3=:{PORTS[2]}")
 
-# Create the three transactions
+section("Creating transactions")
 h_t1, t1 = make_tx("S1", "S2", 10)
 h_t2, t2 = make_tx("S2", "S3", 20)
 h_t3, t3 = make_tx("S3", "S1", 30)
+print(f"    T1: S1→S2, 10 coins    hash={h_t1[:12]}…")
+print(f"    T2: S2→S3, 20 coins    hash={h_t2[:12]}…")
+print(f"    T3: S3→S1, 30 coins    hash={h_t3[:12]}…")
 
-print("  Transactions:")
-print(f"    T1 = {t1}  hash={h_t1[:16]}...")
-print(f"    T2 = {t2}  hash={h_t2[:16]}...")
-print(f"    T3 = {t3}  hash={h_t3[:16]}...")
+section("Selective delivery (no broadcast)")
+store_local(PORTS[0], h_t1, t1); store_local(PORTS[1], h_t1, t1)
+store_local(PORTS[1], h_t2, t2); store_local(PORTS[2], h_t2, t2)
+store_local(PORTS[2], h_t3, t3); store_local(PORTS[0], h_t3, t3)
+print(f"    T1 → S1, S2      T2 → S2, S3      T3 → S3, S1")
 
-# Selective delivery via /inv_local (no broadcasting)
-print("\n  Selective delivery via POST /inv_local (no flood):")
-store_local(PORTS[0], h_t1, t1);  print(f"    T1 -> S1 (creator)")
-store_local(PORTS[1], h_t1, t1);  print(f"    T1 -> S2 (target)")
-store_local(PORTS[1], h_t2, t2);  print(f"    T2 -> S2 (creator)")
-store_local(PORTS[2], h_t2, t2);  print(f"    T2 -> S3 (target)")
-store_local(PORTS[2], h_t3, t3);  print(f"    T3 -> S3 (creator)")
-store_local(PORTS[0], h_t3, t3);  print(f"    T3 -> S1 (target)")
+section("Mempools after delivery")
+print_mempools()
 
-print_mempools("Mempools after selective delivery")
-
-# Verify
 s1_txs = {tx["sender"] + tx["receiver"] for tx in (http_get(PORTS[0], "/mempool") or [])}
 s2_txs = {tx["sender"] + tx["receiver"] for tx in (http_get(PORTS[1], "/mempool") or [])}
 s3_txs = {tx["sender"] + tx["receiver"] for tx in (http_get(PORTS[2], "/mempool") or [])}
 ok = (s1_txs == {"S1S2", "S3S1"} and s2_txs == {"S1S2", "S2S3"} and s3_txs == {"S2S3", "S3S1"})
-print(f"\n  Assignment scenario reproduced correctly: {'YES' if ok else 'NO'}")
-
-input("\n  [Press Enter to mine a block on each node -> divergent ledgers...]")
-
-# Each node mines with its local mempool
-print("\n  Mining (each node uses its own mempool):")
-bh1, r = mine_block(PORTS[0]);  print(f"    S1 mined: {(bh1 or '?')[:24]}...")
-bh2, r = mine_block(PORTS[1]);  print(f"    S2 mined: {(bh2 or '?')[:24]}...")
-bh3, r = mine_block(PORTS[2]);  print(f"    S3 mined: {(bh3 or '?')[:24]}...")
-
-print_chains("Chains after mining -- all different blocks on the same genesis")
-all_diff = len({bh1, bh2, bh3}) == 3
-print(f"\n  All three blocks different: {'YES -- ledgers have diverged!' if all_diff else 'NO'}")
-
-input("\n  [Press Enter to connect nodes and attempt consensus (Part 2)...]")
-
-# =============================================================================
-# PART 2 -- Task 2a: equal-length tie, consensus cannot resolve
-# =============================================================================
-
-print("\n" + "=" * 62)
-print("  PART 2 -- Task 2a: connecting nodes, equal-length tie")
-print("=" * 62)
-print("""
-  All chains are height=1. Longest-chain rule only fires when a peer
-  has a STRICTLY longer chain. Nobody switches -> inconsistency persists.
-""")
-
-print("  Connecting all nodes via /addpeer...")
-connect_all()
-
-print("  Waiting 15 s for consensus rounds to run...")
-time.sleep(15)
-
-print_chains("After first consensus round")
-
-if all_agree():
-    print("\n  Nodes happen to agree (rare for equal-length chains).")
+if ok:
+    result_pass("Mempools match assignment scenario exactly")
 else:
-    print("""
-  FAIL (expected): nodes still disagree.
+    result_fail("Mempools do not match expected scenario")
 
-    Each node downloaded the others' blocks (store=3) but kept its own
-    block as canonical -- because no chain is strictly longer.
-    This is the known limitation of the longest-chain algorithm.
-""")
+input("\n  [Enter] Mine a block on each node →")
 
-input("\n  [Press Enter to break the tie (Part 3 -- consensus succeeds)...]")
+section("Mining one block per node")
+bh1, r = mine_block(PORTS[0]); print(f"    S1 mined: {(bh1 or '?')[:16]}…")
+bh2, r = mine_block(PORTS[1]); print(f"    S2 mined: {(bh2 or '?')[:16]}…")
+bh3, r = mine_block(PORTS[2]); print(f"    S3 mined: {(bh3 or '?')[:16]}…")
+
+section("Chain state — three different height-1 chains")
+print_chains()
+
+all_diff = len({bh1, bh2, bh3}) == 3
+if all_diff:
+    result_fail("Ledgers have DIVERGED — all three blocks are different")
+else:
+    result_pass("Blocks are not all different (unexpected)")
+
+input("\n  [Enter] Connect nodes and attempt consensus (Part 2) →")
 
 # =============================================================================
-# PART 3 -- Task 2b: S1 mines a second block, consensus resolves
+# PART 2 -- Equal-length tie
 # =============================================================================
 
-print("\n" + "=" * 62)
-print("  PART 3 -- Task 2b: one chain grows longer, consensus SUCCEEDS")
-print("=" * 62)
+banner("PART 2 — Equal-length tie (failure → resolution)")
+
 print("""
-  We send a new transaction directly to S1 and let it mine a second block
-  (height=2). S2 and S3 will detect the longer chain and adopt it.
+  All chains are height=1.  Longest-chain rule needs a STRICTLY longer
+  chain, so equal-length tie leaves nodes stuck.
+
+  Tie-break rule: when heights are equal, adopt the chain whose tip
+  hash is lexicographically smallest (deterministic, no extra messages).
 """)
 
-h_t4, t4, r = send_tx(PORTS[0], "S1", "S2", 99)
-print(f"  T4 -> S1  {t4}  result={r}")
+tips = {}
+for i, port in enumerate(PORTS):
+    chain = http_get(port, "/getblocks") or []
+    tips[NAMES[i]] = chain[-1] if chain else ""
 
+winning_name = min(tips, key=lambda n: tips[n])
+winning_tip  = tips[winning_name]
+
+section("STEP 2a — Connect nodes (before consensus fires)")
+connect_all()
+print(f"    All nodes connected via /addpeer")
+
+section("Chain state — immediately after connecting")
+print_chains_compact()
+
+if not all_agree():
+    result_fail("Nodes DISAGREE — consensus has not fired yet")
+    print("    All chains are height=1, no chain is strictly longer.")
+    print(f"    Predicted tie-break winner: {winning_name} (smallest tip hash)")
+else:
+    result_pass("Consensus fired instantly (timing was close)")
+
+input("\n  [Enter] Wait for tie-break consensus round →")
+
+section("STEP 2b — After consensus round")
+wait_msg(7)
+print_chains_compact()
+
+adopted_tip = (http_get(PORTS[0], "/getblocks") or [""])[-1]
+if all_agree() and adopted_tip == winning_tip:
+    result_pass(f"Tie-break resolved — all adopted {winning_name}'s chain")
+    print(f"    Tip: {winning_tip[:24]}…")
+    print("    Mechanism: equal height → compare tip hashes → smallest wins")
+elif all_agree():
+    result_pass(f"Nodes agree (tip={adopted_tip[:16]}…)")
+else:
+    print("    Nodes still disagree, waiting 7s more...")
+    time.sleep(7)
+    print_chains_compact()
+    if all_agree():
+        result_pass("Tie-break resolved (needed extra time)")
+    else:
+        result_fail("Still disagreeing")
+
+input("\n  [Enter] Grow one chain longer (Part 3) →")
+
+# =============================================================================
+# PART 3 -- Longer chain wins
+# =============================================================================
+
+banner("PART 3 — Longer chain wins (consensus succeeds)")
+
+print("""
+  S1 gets a new transaction and mines block 2 (height=2).
+  S2 and S3 still have height=1.  Consensus detects the longer chain
+  and all nodes adopt S1's chain.
+""")
+
+section("S1 mines block 2")
+h_t4, t4, r = send_tx(PORTS[0], "S1", "S2", 99)
+print(f"    New tx: S1→S2, 99 coins")
 bh_new, r = mine_block(PORTS[0])
 if bh_new:
-    print(f"  S1 mined block 2: {bh_new[:24]}...  result={r}")
-    print_chains("After S1 mines block 2  (S1=height 2, others still height 1)")
+    print(f"    S1 mined: {bh_new[:16]}…")
 else:
-    print(f"  Mining failed: {r}")
+    print(f"    Mining failed: {r}")
 
-print("\n  Waiting 15 s for the next consensus round...")
-time.sleep(15)
+section("Chain state — S1 ahead, others behind")
+print_chains_compact()
 
-print_chains("After second consensus round")
+section("After consensus round")
+wait_msg(7)
+print_chains_compact()
 
 if all_agree():
     chains = [http_get(p, "/getblocks") or [] for p in PORTS]
-    tip = (chains[0][-1] if chains[0] else "?")[:24]
-    print(f"""
-  OK  All nodes now agree (height=2, tip={tip}...)
-
-    All three nodes show the SAME two block hashes -- proof they are
-    on the same chain.  S2 and S3 did NOT mine new blocks; they
-    REPLACED their own height-1 chain with S1's height-2 chain.
-    That replacement is what brought their height from 1 to 2.
-
-    What happened:
-      1. S2 and S3 asked each peer: GET /chainlen
-      2. S1 replied with 2; S2 and S3 had 1 -> strictly longer -> sync
-      3. S2 and S3 downloaded S1's two blocks via GET /getdata/<hash>
-      4. Both discarded their old block and adopted S1's chain
-""")
+    tip = (chains[0][-1] if chains[0] else "?")[:16]
+    result_pass(f"All nodes agree — adopted S1's chain (height=2, tip={tip}…)")
+    print("    Mechanism: S1 has height=2 > others' height=1 → sync")
 else:
-    print("""
-  Nodes still disagree after the second round.
-  Possible cause: consensus background timer hasn't fired yet.
-  Waiting an extra 15 s...
-""")
-    time.sleep(15)
-    print_chains("After extra wait")
+    print("    Waiting 7s more...")
+    time.sleep(7)
+    print_chains_compact()
     if all_agree():
-        print("\n  OK  All nodes agree now.")
+        result_pass("All nodes agree now")
     else:
-        print("\n  Still disagreeing -- inspect manually:")
-        for i, port in enumerate(PORTS):
-            print(f"    http://127.0.0.1:{port}/status")
+        result_fail("Still disagreeing")
+
+input("\n  [Enter] Consensus failure under load (Part 4) →")
+
+# =============================================================================
+# PART 4 -- Rapid concurrent mining outpaces consensus
+# =============================================================================
+
+banner("PART 4 — Consensus FAILURE: rapid concurrent mining")
+
+print("""
+  All 3 nodes mine simultaneously every 0.5s.
+  Consensus round runs every 5s.
+  → Forks are created 10x faster than consensus can resolve.
+  → Each node's transactions are LOCAL ONLY (peers reject the blocks).
+  → The system never stabilises.
+""")
+
+MINING_ROUNDS = 5
+MINE_INTERVAL = 0.5
+
+
+def _inject_and_mine(port, name, rnd, results):
+    """Thread target: inject a unique tx into one node, then mine a block."""
+    content = {"sender": name, "receiver": f"rapid_{rnd}", "amount": rnd + port * 0.001}
+    h = tx_hash(content)
+    store_local(port, h, content)
+    bh, r = mine_block(port)
+    results[name] = (bh, r, content)
+
+
+section("Starting state (all agree from Part 3)")
+print_chains_compact()
+
+disagree_rounds = []
+agree_rounds = []
+
+for rnd in range(1, MINING_ROUNDS + 1):
+    results = {}
+    threads = [
+        threading.Thread(target=_inject_and_mine, args=(port, name, rnd, results))
+        for port, name in zip(PORTS, NAMES)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    print(f"\n  ── Round {rnd}/{MINING_ROUNDS} ({'─' * 44}")
+
+    for name in NAMES:
+        bh, r, tx = results.get(name, (None, None, {}))
+        if bh:
+            print(f"    {name} mined {bh[:12]}…  (tx: {tx['sender']}→{tx['receiver']})")
+        else:
+            print(f"    {name} FAILED ({r})")
+
+    chain_data = {}
+    for port, name in zip(PORTS, NAMES):
+        s = http_get(port, "/status") or {}
+        chain_data[name] = {
+            "height": s.get("chain_height", 0),
+            "tip": (s.get("chain_tip") or "?")[:12],
+            "store": s.get("block_store_size", 0),
+            "chain": s.get("chain", []),
+        }
+
+    for name in NAMES:
+        d = chain_data[name]
+        print(f"    {name}: height={d['height']}  tip={d['tip']}…  store={d['store']}")
+
+    chains = [tuple(chain_data[n]["chain"]) for n in NAMES]
+    agree = len(set(chains)) == 1
+    if agree:
+        agree_rounds.append(rnd)
+        print("    → AGREE")
+    else:
+        disagree_rounds.append(rnd)
+        print(f"    → DISAGREE ({len(set(chains))} different chains)")
+
+    time.sleep(MINE_INTERVAL)
+
+# Conclusion
+total = MINING_ROUNDS
+dis = len(disagree_rounds)
+agr = len(agree_rounds)
+
+section("Part 4 results")
+
+for port, name in zip(PORTS, NAMES):
+    s = http_get(port, "/status") or {}
+    h = s.get("chain_height", 0)
+    st = s.get("block_store_size", 0)
+    print(f"    {name}: chain={h} blocks, store={st} blocks, orphaned={st - h}")
+
+print(f"""
+    Disagreement: {dis}/{total} rounds ({100*dis//max(total,1)}%)
+    Agreement:    {agr}/{total} rounds ({100*agr//max(total,1)}%)""")
+
+if dis > 0:
+    result_fail("Consensus CANNOT keep up with mining rate")
+    print(f"    Mining: 1 block / {MINE_INTERVAL}s per node")
+    print(f"    Consensus: 1 round / 5s")
+    print(f"    Orphaned blocks = wasted work that overloads the system")
+else:
+    result_pass("Consensus kept up (unexpected)")
+
+input("\n  [Enter] Summary and exit →")
 
 # =============================================================================
 # Summary
 # =============================================================================
 
-print("\n" + "=" * 62)
-print("  SUMMARY")
-print("=" * 62)
+banner("SUMMARY")
+
 print("""
-  Algorithm: longest-chain consensus (consensus.py + state.py)
-  ------------------------------------------------------------
-  Every 10 s each node:
-    1. Discovers peers via GET /addr
-    2. Downloads missing blocks from peers
-    3. Asks each peer: GET /chainlen
-       If peer length > ours -> download and adopt their chain
+  Algorithm: longest-chain + tip-hash tie-breaking
+  ─────────────────────────────────────────────────
+  Part 1:  Without consensus → ledgers diverge
+  Part 2:  Equal-height tie  → tie-break resolves it     ✓
+  Part 3:  Longer chain      → consensus adopts it       ✓
+  Part 4:  Rapid mining      → consensus can't keep up   ✗
 
-  Works when:  chains have DIFFERENT lengths
-  Fails when:  all chains are the same length (tie, as shown in Part 2)
-
-  Fix for the tie (not implemented):
-    When lengths are equal, prefer the chain whose tip hash is
-    lexicographically smaller -- deterministic, no extra messages.
+  The algorithm works when given time, but fails when
+  blocks are produced faster than the round interval.
 """)
 
 print(f"  Nodes still live for inspection:")
 for i, port in enumerate(PORTS):
     print(f"    http://127.0.0.1:{port}/status")
 
-input("\n  [Press Enter to stop all nodes and exit...]")
+input("\n  [Enter] Stop all nodes and exit →")
 stop_all()

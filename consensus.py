@@ -5,11 +5,9 @@ Each node periodically asks all known peers for their chain length.
 If any peer has a strictly longer chain, we download their full chain
 (fetching any blocks we don't yet have) and adopt it as our canonical chain.
 
-This is the same rule Bitcoin uses: the chain with the most blocks wins.
-
-Limitation: equal-length competing chains cannot be resolved without a
-tiebreaker (e.g. lower tip-hash wins). This is intentionally left as a
-demonstrable failure case.
+Tie-breaking rule (equal-length chains): when two chains have the same
+height, prefer the one whose tip hash is lexicographically smaller.
+This is deterministic and requires no extra messages.
 """
 
 import state
@@ -43,22 +41,36 @@ def _download_block(peer: str, block_hash: str) -> bool:
 
 def sync_from_peer(peer: str) -> bool:
     """
-    Download and adopt a peer's chain if it is longer than ours.
+    Download and adopt a peer's chain if it is longer than ours, or if it
+    has the same length but a lexicographically smaller tip hash (tie-break).
     Returns True if our canonical chain was updated.
     """
     their_len = _get_peer_chain_length(peer)
     with state.lock:
         our_len = state.chain_height()
+        our_tip = state.chain_tip() or ""
 
-    if their_len <= our_len:
-        return False  # Not longer, nothing to do
+    if their_len < our_len:
+        return False  # Strictly shorter, nothing to do
 
-    print(f"  [consensus] peer {peer} has chain len={their_len} (ours={our_len}), syncing...")
-
-    # Get their full canonical chain hash list (genesis → tip)
+    # Fetch their chain hash list (needed for both the tie-break check and adoption)
     their_hashes = http_get(f"http://{peer}/getblocks")
     if not their_hashes:
         return False
+
+    their_tip = their_hashes[-1]
+    is_tiebreak = False
+
+    if their_len == our_len:
+        if their_tip >= our_tip:
+            return False  # Same length, our tip is already ≤ theirs — keep ours
+        is_tiebreak = True
+        print(
+            f"  [consensus] tie at height={our_len}: "
+            f"peer tip={their_tip[:16]}... < ours={our_tip[:16]}..., breaking tie"
+        )
+    else:
+        print(f"  [consensus] peer {peer} has chain len={their_len} (ours={our_len}), syncing...")
 
     # Download any blocks we don't yet have, in chain order
     for h in their_hashes:
@@ -69,10 +81,11 @@ def sync_from_peer(peer: str) -> bool:
 
     # Try to adopt their chain
     with state.lock:
-        adopted = state.adopt_chain(their_hashes)
+        adopted = state.adopt_chain(their_hashes, allow_equal=is_tiebreak)
 
     if adopted:
-        print(f"  [consensus] adopted chain from {peer} (height={their_len})")
+        verb = "tie-break adopted" if is_tiebreak else "adopted"
+        print(f"  [consensus] {verb} chain from {peer} (height={their_len})")
     else:
         print(f"  [consensus] could not adopt chain from {peer} (missing blocks?)")
 
