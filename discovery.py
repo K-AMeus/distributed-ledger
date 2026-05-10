@@ -2,14 +2,12 @@
 discovery.py — Peer discovery and block synchronisation.
 
 discover_peers():
-    Walks the network using BFS starting from known peers.
-    Asks each peer for their peer list via GET /addr.
-    Stops when no new peers are found.
-    Avoids infinite loops by tracking already-visited peers.
+    BFS walk starting from known peers using GET /addr.
 
 sync_blocks():
-    After discovery, asks all known peers for their block hashes.
-    Downloads any blocks this node is missing via GET /getdata/<hash>.
+    Downloads blocks from peers that are missing from our block_store.
+    Uses state.add_block() so the canonical chain is updated correctly
+    whenever a peer's blocks form a longer chain.
 """
 
 import state
@@ -17,29 +15,16 @@ from client import http_get
 
 
 def discover_peers():
-    """
-    BFS peer discovery.
-
-    Start from the peers we already know (loaded from config),
-    ask each one for their peers, add any new ones to the queue,
-    and keep going until the queue is empty.
-
-    We track 'visited' to avoid asking the same peer twice
-    and to avoid asking ourselves (circular reference).
-    """
     print("\n[peer discovery] starting...")
 
-    # Mark ourselves as visited so we never add ourselves as a peer
     visited = {state.my_addr()}
 
-    # Seed the queue with peers we already know
     with state.lock:
         queue = list(state.peers)
 
     while queue:
         peer = queue.pop(0)
 
-        # Skip if we have already asked this peer
         if peer in visited:
             continue
         visited.add(peer)
@@ -47,56 +32,55 @@ def discover_peers():
         print(f"  [/addr] asking {peer}")
         result = http_get(f"http://{peer}/addr")
 
-        # Peer is offline or returned an error — skip it
         if result is None:
             continue
 
         with state.lock:
             for p in result:
-                # Never add ourselves
                 if p == state.my_addr():
                     continue
-                # Add to our peer list if new
                 if p not in state.peers:
                     state.peers.add(p)
                     print(f"  [new peer] {p}")
-                # Add to queue if we haven't visited it yet
                 if p not in visited:
                     queue.append(p)
 
     with state.lock:
-        print(f"[peer discovery] done. Known peers: {state.peers}\n")
+        print(f"[peer discovery] done. peers={state.peers}\n")
 
 
 def sync_blocks():
     """
-    Block synchronisation.
-
-    Ask every known peer for their list of block hashes.
-    For each hash we don't have yet, fetch the full block content.
-    This ensures a newly started node catches up with the network.
+    Download blocks from all peers that we don't yet have in our block_store.
+    Blocks are added via state.add_block() which automatically updates the
+    canonical chain if a longer chain is found.
     """
     print("[block sync] starting...")
 
     with state.lock:
         current_peers = list(state.peers)
-        known_hashes = set(state.blocks.keys())
+        known = set(state.block_store.keys())
 
     for peer in current_peers:
-        # Get the list of block hashes this peer has
         result = http_get(f"http://{peer}/getblocks")
         if not result:
             continue
 
         for h in result:
-            # Only fetch blocks we don't already have
-            if h not in known_hashes:
-                block_data = http_get(f"http://{peer}/getdata/{h}")
-                if block_data and "content" in block_data:
-                    with state.lock:
-                        state.blocks[h] = block_data["content"]
-                    known_hashes.add(h)
-                    print(f"  [synced block] {h[:8]}... : {block_data['content']}")
+            if h in known:
+                continue
+            block_data = http_get(f"http://{peer}/getdata/{h}")
+            if not block_data or "content" not in block_data:
+                continue
+            block = block_data["content"]
+            content = block.get("content")
+            prev_hash = block.get("prev_hash", state.GENESIS_PREV)
+            if content is None:
+                continue
+            with state.lock:
+                state.add_block(h, content, prev_hash)
+            known.add(h)
+            print(f"  [synced] {h[:8]}... from {peer}")
 
     with state.lock:
-        print(f"[block sync] done. Total blocks: {len(state.blocks)}\n")
+        print(f"[block sync] done. chain={state.chain_height()} store={len(state.block_store)}\n")

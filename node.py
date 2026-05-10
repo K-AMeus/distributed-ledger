@@ -2,11 +2,12 @@
 node.py — Main entrypoint. Starts the P2P node.
 
 Usage:
-    python node.py <port> [config_file]
+    python node.py <port> [ip] [config_file]
 
 Examples:
     python node.py 5001
-    python node.py 5001 config_5001.json
+    python node.py 5001 192.168.1.10
+    python node.py 5001 127.0.0.1 network.json
 """
 
 import sys
@@ -17,35 +18,32 @@ import state
 import config
 import discovery
 import server
+import consensus
 
 
-def startup_tasks():
-    """Run peer discovery and block sync after server has started."""
+def background_loop():
+    """Peer discovery + block sync + consensus, repeated every 10 s."""
+    time.sleep(1)  # Let the HTTP server start first
     while True:
-        time.sleep(1)  # Wait for server to be ready
         discovery.discover_peers()
         discovery.sync_blocks()
+        consensus.run_consensus_round()
         time.sleep(10)
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python node.py <port> [config_file]")
+        print("Usage: python node.py <port> [ip] [config_file]")
         sys.exit(1)
 
-    # Set this node's port
     state.MY_PORT = int(sys.argv[1])
-    
     state.MY_IP = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
     config_file = sys.argv[3] if len(sys.argv) > 3 else "network.json"
 
-    # Load config (initial peers)
     config.load_config(config_file)
 
-    # Run discovery and sync in background after server starts
-    threading.Thread(target=startup_tasks, daemon=True).start()
+    threading.Thread(target=background_loop, daemon=True).start()
 
-    # Start HTTP server (blocking)
     try:
         server.run_server(state.MY_PORT)
     except KeyboardInterrupt:

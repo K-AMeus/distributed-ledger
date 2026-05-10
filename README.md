@@ -1,4 +1,4 @@
-# ITI0215_26 — P2P Rakendus
+# ITI0215_26 — Hajutatud Ledger konsensusega
 
 ## Käivitamine
 
@@ -7,6 +7,8 @@ Python 3.9+ peab olema installitud, muid sõltuvusi pole.
 Ühe sõlme käivitamine:
 ```bash
 python node.py <port>
+python node.py <port> <ip>
+python node.py <port> <ip> <config_file>
 ```
 
 Mitu sõlme samal masinal (eri terminalides):
@@ -21,10 +23,66 @@ Mitme masinaga käivitamine (IP tuleb ette anda):
 python node.py 5001 192.168.1.10
 ```
 
-Testiskripti käivitamine:
+### Demoskriptid
+
+Divergentsi ja konsensuse demo (soovituslik):
 ```bash
-python test_network.py
+python demo_divergence.py
 ```
+
+Vana põhiline võrgutesti skript:
+```bash
+python test_network_single_machine.py
+```
+
+---
+
+## Arhitektuur
+
+### Moodulid
+
+| Fail | Eesmärk |
+|------|---------|
+| `node.py` | Käivituspunkt. Alustab HTTP serveri ja taustaahela. |
+| `server.py` | HTTP serveris kõik endpointid. |
+| `state.py` | Jagatud globaalne olek: `block_store`, `blocks` (kanooniline kett), `transactions`, `peers`. |
+| `consensus.py` | Pikim-kett konsensuse algoritm. |
+| `discovery.py` | BFS peer-avastamine ja plokkide sünkimine. |
+| `broadcast.py` | Flood-levitamine kõigile teadaolevatele peers'idele. |
+| `client.py` | HTTP GET/POST abifunktsioonid. |
+| `config.py` | `network.json` laadimine algpeerside jaoks. |
+
+### Oleku struktuur
+
+```
+state.block_store   — kõik teadaolevad plokid, sh kahvlid
+                      hash -> {content, prev_hash, height}
+
+state.blocks        — kanooniline kett (genesis -> tipp)
+                      järjestatud dict, ainult peakett
+
+state.transactions  — mempool: kinnitamata tehingud
+state.peers         — teadaolevad peer-aadressid
+```
+
+Kui saabub uus plokk mis loob pikema keti kui praegune, kutsutakse `state.add_block()` mis ehitab `state.blocks` ümber.
+
+---
+
+## Konsensuse algoritm
+
+Kasutatakse **pikim-kett võidab** (Bitcoin-stiil):
+
+1. Igal plokil on `prev_hash` ja arvutatud `height` (kaugus genesisest).
+2. Iga 10 sekundi järel küsib iga sõlm kõigilt peers'idelt: `GET /chainlen`.
+3. Kui peers'il on **rangelt pikem** kett:
+   - Laadib alla tema ploki hashid (`GET /getblocks`)
+   - Laadib puuduvad plokid (`GET /getdata/<hash>`)
+   - Võtab keti üle (`state.adopt_chain()`)
+
+**Töötab kui:** ühe partitsiooni kett on pikem teisest — lühem asendatakse.
+
+**Ei tööta kui:** kaks partitsiooni on täpselt sama pikkusega — kumbki ei laadi teise ketti üle. See on demonstreeritav tõrkejuhtum.
 
 ---
 
@@ -36,30 +94,58 @@ Kõik sõlmed suhtlevad HTTP kaudu. Aadress on kujul `ip:port`, näiteks `127.0.
 
 ### GET /addr
 
-Tagastab kõik teadaolevad sõlmed.
+Tagastab kõik teadaolevad peers'id.
 
-Päring:
 ```
 GET http://127.0.0.1:5001/addr
 ```
-
-Vastus:
 ```json
 ["127.0.0.1:5002", "127.0.0.1:5003"]
 ```
 
 ---
 
+### GET /chainlen
+
+Tagastab kanonilise keti pikkuse (plokiarv).
+
+```
+GET http://127.0.0.1:5001/chainlen
+```
+```json
+2
+```
+
+---
+
+### GET /status
+
+Tagastab debug-hetktõmmise: keti kõrgus, block_store suurus, mempool, peers, keti hashid.
+
+```
+GET http://127.0.0.1:5001/status
+```
+```json
+{
+  "port": 5001,
+  "chain_height": 2,
+  "block_store_size": 3,
+  "mempool_size": 0,
+  "peers": ["127.0.0.1:5002"],
+  "chain_tip": "eb54d8eb...",
+  "chain": ["7525cf5a...", "eb54d8eb..."]
+}
+```
+
+---
+
 ### GET /getblocks
 
-Tagastab kõik ploki hashid järjekorras.
+Tagastab kanonilise keti ploki hashid järjekorras (genesis → tipp).
 
-Päring:
 ```
 GET http://127.0.0.1:5001/getblocks
 ```
-
-Vastus:
 ```json
 ["a3f1c2d4...", "b9e4d1f2..."]
 ```
@@ -68,93 +154,65 @@ Vastus:
 
 ### GET /getblocks/\<hash\>
 
-Tagastab ploki hashid alates antud hashist (kasutatakse sünkimiseks).
+Tagastab keti hashid alates antud hashist (kasutatakse inkrementaalseks sünkimiseks).
 
-Päring:
 ```
 GET http://127.0.0.1:5001/getblocks/a3f1c2d4...
 ```
-
-Vastus:
 ```json
 ["b9e4d1f2..."]
 ```
-
-Kui hashi ei leita, tagastatakse kõik hashid.
 
 ---
 
 ### GET /getdata/\<hash\>
 
-Tagastab ühe ploki sisu.
+Tagastab ühe ploki sisu (otsitakse `block_store`'ist, sh kahvliplokid).
 
-Päring:
 ```
 GET http://127.0.0.1:5001/getdata/b9e4d1f2...
 ```
-
-Vastus (leitud):
 ```json
 {
   "hash": "b9e4d1f2...",
   "content": {
     "content": {
-      "transactions": [
-        {"sender": "Jaan", "receiver": "Ants", "amount": 0.0001}
-      ],
+      "transactions": [{"sender": "Jaan", "receiver": "Ants", "amount": 0.0001}],
       "timestamp": 1708000000
     },
-    "prev_hash": "a3f1c2d4..."
+    "prev_hash": "a3f1c2d4...",
+    "height": 2
   }
 }
-```
-
-Vastus (ei leitud):
-```json
-{"error": "block not found"}
 ```
 
 ---
 
 ### POST /inv
 
-Uue tehingu vastuvõtmine. Salvestatakse mempoolile ja saadetakse kõigile teistele sõlmedele edasi. Duplikaadid ignoreeritakse.
+Uue tehingu vastuvõtmine. Salvestatakse mempoolile ja saadetakse flood-meetodil edasi. Duplikaadid ignoreeritakse.
 
-Päring:
 ```
 POST http://127.0.0.1:5001/inv
 Content-Type: application/json
 
-{
-  "hash": "abc123...",
-  "content": {"sender": "Jaan", "receiver": "Ants", "amount": 0.0001}
-}
+{"hash": "abc123...", "content": {"sender": "Jaan", "receiver": "Ants", "amount": 0.0001}}
 ```
 
-Hash arvutatakse nii: `sha256(json.dumps(content, sort_keys=True))` hex-kujul.
+Hash: `sha256(json.dumps(content, sort_keys=True))` hex-kujul.
 
-Vastus (vastu võetud):
-```json
-1
-```
-
-Vastus (juba olemas):
-```json
-{"status": "already known"}
-```
-
-Vastus (hash ei klapi):
-```json
-{"errcode": 3, "errmsg": "hash mismatch, expected <õige_hash>"}
-```
+| Vastus | Tähendus |
+|--------|----------|
+| `1` | Vastu võetud |
+| `{"status": "already known"}` | Juba teada |
+| `{"errcode": 3, ...}` | Hashi mittevastavus |
 
 ---
 
 ### POST /block
 
-Uue ploki vastuvõtmine. Kontrollitakse hashchain'i, vaadatakse et kõik tehingud oleksid mempoolil olemas, salvestatakse plokk, eemaldatakse kinnitatud tehingud mempoolist ja saadetakse edasi.
+Uue ploki vastuvõtmine. Kontrollitakse hash-integriteet, vaadatakse et kõik tehingud oleksid mempoolil, salvestatakse `block_store`'i, uuendatakse kanoonilist ketti kui plokk loob pikema haru.
 
-Päring:
 ```
 POST http://127.0.0.1:5001/block
 Content-Type: application/json
@@ -163,39 +221,37 @@ Content-Type: application/json
   "hash": "ff291a...",
   "prev_hash": "a3f1c2d4...",
   "content": {
-    "transactions": [
-      {"sender": "Jaan", "receiver": "Ants", "amount": 0.0001}
-    ],
+    "transactions": [{"sender": "Jaan", "receiver": "Ants", "amount": 0.0001}],
     "timestamp": 1708000000
   }
 }
 ```
 
-Hash arvutatakse:
-```python
-sha256(json.dumps({"content": content, "prev_hash": prev_hash}, sort_keys=True))
+Hash: `sha256(json.dumps({"content": content, "prev_hash": prev_hash}, sort_keys=True))`
+
+Genesis-plokk kasutab `prev_hash = "0" * 64`.
+
+| Vastus | Tähendus |
+|--------|----------|
+| `1` | Vastu võetud |
+| `{"status": "already known"}` | Juba teada |
+| `{"errcode": 3, ...}` | Hashi mittevastavus |
+| `{"errcode": 4, ...}` | Tehing puudub mempoolist |
+
+---
+
+### POST /addpeer
+
+Lisab uue peer-aadressi käituse ajal (ilma sõlme taaskäivitamiseta).
+
 ```
+POST http://127.0.0.1:5001/addpeer
+Content-Type: application/json
 
-Esimene plokk (genesis) kasutab `prev_hash = "0" * 64`.
-
-Vastus (vastu võetud):
-```json
-1
+{"addr": "127.0.0.1:5002"}
 ```
-
-Vastus (juba olemas):
 ```json
-{"errcode": 1, "errmsg": "already known"}
-```
-
-Vastus (tehing puudub mempoolist):
-```json
-{"errcode": 4, "errmsg": "unknown transaction ab12cd34"}
-```
-
-Vastus (hash ei klapi):
-```json
-{"errcode": 3, "errmsg": "hash mismatch, expected <õige_hash>"}
+{"status": "ok", "peers": ["127.0.0.1:5002"]}
 ```
 
 ---
@@ -204,40 +260,46 @@ Vastus (hash ei klapi):
 
 ```
 5001 (bootstrap)
-  ├── 5002
-  ├── 5003
-  ├── 5004
-  └── 5005
+  -- 5002
+  -- 5003
+  -- 5004
+  -- 5005
 ```
 
-Iga sõlm laeb algul peers'id `network.json` failist. Käivitumisel teeb BFS otsingu läbi `/addr` ja leiab kõik aktiivsed sõlmed. Avastamine kordub iga 10 sekundi järel taustal. Uus sõlm, mis võrku liitub, leiab automaatselt kõik teised sõlmed ja sünkib plokid.
-
-Blokkide ja tehingute edastamine toimub flood-meetodil — iga sõlm saadab saadud info kõigile teistele edasi, duplikaadid filtreeritakse hashiga.
+Iga sõlm laeb algul peers'id `network.json` failist. Käivitumisel teeb BFS otsingu läbi `/addr` ja leiab kõik aktiivsed sõlmed. Avastamine + konsensuse ring korduvad iga 10 sekundi järel taustal.
 
 ---
 
-## Katseosa
+## Demo tulemused
 
-### Metoodika
+### demo_divergence.py
 
-`test_network.py` käivitab automaatse stsenaariumi:
+**Osa 1 — Divergentsi loomine**
 
-1. Käivitatakse 5 sõlme (pordid 5001–5005)
-2. Saadetakse 10 tehingut sõlmele 5001
-3. Tehingud pannakse plokki ja saadetakse — kontrollitakse propagatsiooni
-4. Tapetakse sõlmed 5003 ja 5004 — vaadatakse kas ülejäänud töötavad edasi
-5. Saadetakse tehingud ja plokk kuni kahte sõlme on maas
-6. Lisatakse 3 uut sõlme (5010–5012) — vaadatakse kas nad süngivad plokid
-7. Stressitest: 50 tehingut laiali kõigile sõlmedele, pannakse plokki
+Kolm sõlme käivitati täielikus isolatsioonis (peers puuduvad). Igale saadeti unikaalne tehing ja igaüks kaevandas oma ploki genesis-ploki peale.
 
-### Tulemused
+| Sõlm | Ledger | Tehing |
+|------|--------|--------|
+| S1 | [B1] | Alice -> Bob, 10 |
+| S2 | [B2] | Bob -> Carol, 20 |
+| S3 | [B3] | Carol -> Alice, 30 |
 
-| Test | Tulemus |
-|------|---------|
-| Peer discovery (5 sõlme) | Kõik leitud ~2s jooksul |
-| Tehingute laialisaatmine | Jõudis kõigini koheselt |
-| Ploki propageerimine | Kõik sünkisid ~2s jooksul |
-| 2 sõlme tapmine | Ülejäänud 3 töötasid edasi |
-| 3 uue sõlme lisamine | Sünkisid kõik plokid ~10s jooksul |
-| Stressitest (50 tehingut) | ~1400–1800 tehingut/sek |
-| Maksimaalselt testitud sõlmi | 8 korraga |
+Tulemus: kõigil height=1 aga erinevad tip-hashid — ledgerid on erinevad.
+
+**Osa 2 — Võrdse pikkusega kahvel (konsensus EI tööta)**
+
+Pärast sõlmede ühendamist (`/addpeer`) jäid kõik kolm ketti height=1. Konsensuse algoritm nõuab **rangelt** pikemat ketti — viik ei lahendu. Kõigil `store=3` (laadisid üksteise plokid alla), aga kanooniline kett jäi enda oma.
+
+**Osa 3 — Pikem kett võidab (konsensus TÖÖTAB)**
+
+S1 kaevanadas teise ploki (height=2). Järgmisel konsensuseringil:
+- S2 ja S3 küsisid `/chainlen` — S1 vastas 2, nemad olid 1
+- Laadisid S1 plokid alla `/getdata` kaudu
+- Võtsid S1 keti üle (`adopt_chain`)
+
+Lõpptulemus: kõik kolm sõlme leppisid kokku täpselt samas ketis.
+
+### Piirangud
+
+- **Võrdse pikkuse viik:** kaks võrdse pikkusega konkureerivat ketti ei lahene automaatselt. Lahendus (implementeerimata): kui pikkused võrdsed, eelistada väiksema tip-hashiga ketti (deterministlik, ei nõua lisasuhtlust).
+- **Plokkide saatmine peers'idele:** `/block` endpoint nõuab et tehingud oleksid mempoolil — sünkimisel kasutatakse seetõttu otse `/getdata` (mempooli kontroll möödutakse).
