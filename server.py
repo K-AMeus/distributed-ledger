@@ -90,6 +90,11 @@ class NodeHandler(BaseHTTPRequestHandler):
                 }
             self.send_json(result)
 
+        elif path == "/mempool":
+            with state.lock:
+                result = list(state.transactions.values())
+            self.send_json(result)
+
         else:
             self.send_json({"error": "unknown endpoint"}, 404)
 
@@ -189,6 +194,30 @@ class NodeHandler(BaseHTTPRequestHandler):
                 args=(h, content, prev_hash),
                 daemon=True,
             ).start()
+
+        # POST /inv_local — store transaction in mempool WITHOUT broadcasting
+        elif path == "/inv_local":
+            h = data.get("hash")
+            content = data.get("content")
+
+            if not h or not content:
+                self.send_json({"errcode": 2, "errmsg": "missing hash or content"}, 400)
+                return
+
+            content_str = json.dumps(content, sort_keys=True) if isinstance(content, dict) else str(content)
+            expected = hashlib.sha256(content_str.encode()).hexdigest()
+            if expected != h:
+                self.send_json({"errcode": 3, "errmsg": "hash mismatch"}, 400)
+                return
+
+            with state.lock:
+                if h in state.transactions:
+                    self.send_json({"status": "already known"})
+                    return
+                state.transactions[h] = content
+
+            print(f"  [local tx] {h[:8]}... : {content}")
+            self.send_json(1)
 
         # POST /addpeer — manually add a peer to this node's known set
         elif path == "/addpeer":
