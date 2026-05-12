@@ -15,7 +15,7 @@ Endpoints:
 import hashlib
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import state
 import broadcast
@@ -219,6 +219,15 @@ class NodeHandler(BaseHTTPRequestHandler):
             print(f"  [local tx] {h[:8]}... : {content}")
             self.send_json(1)
 
+        # POST /sync — run one discovery + sync + consensus cycle right now
+        elif path == "/sync":
+            import discovery
+            import consensus as cons
+            discovery.discover_peers()
+            discovery.sync_blocks()
+            cons.run_consensus_round()
+            self.send_json({"status": "ok"})
+
         # POST /addpeer — manually add a peer to this node's known set
         elif path == "/addpeer":
             addr = data.get("addr")
@@ -236,7 +245,7 @@ class NodeHandler(BaseHTTPRequestHandler):
 
 
 def run_server(port: int):
-    server = HTTPServer(("0.0.0.0", port), NodeHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), NodeHandler)
     print(f"\n[server] node started on port {port}")
     print(f"[server] listening on http://0.0.0.0:{port}")
     print("[server] press Ctrl+C to stop\n")

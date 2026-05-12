@@ -42,7 +42,9 @@ def main():
 
     config.load_config(config_file)
 
-    threading.Thread(target=background_loop, daemon=True).start()
+    # Pass --no-loop to disable the automatic background loop (e.g. for demos)
+    if "--no-loop" not in sys.argv:
+        threading.Thread(target=background_loop, daemon=True).start()
 
     try:
         server.run_server(state.MY_PORT)

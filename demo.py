@@ -56,24 +56,28 @@ def wait_msg(seconds):
 # -- HTTP helpers --------------------------------------------------------------
 
 def http_get(port, path):
-    try:
-        resp = urlopen(f"http://127.0.0.1:{port}{path}", timeout=3)
-        return json.loads(resp.read())
-    except Exception:
-        return None
+    for _ in range(5):
+        try:
+            resp = urlopen(f"http://127.0.0.1:{port}{path}", timeout=5)
+            return json.loads(resp.read())
+        except Exception:
+            time.sleep(0.3)
+    return None
 
 
 def http_post(port, path, data):
-    try:
-        body = json.dumps(data).encode()
-        req = Request(
-            f"http://127.0.0.1:{port}{path}",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
-        return json.loads(urlopen(req, timeout=3).read())
-    except Exception as e:
-        return f"ERROR: {e}"
+    for _ in range(5):
+        try:
+            body = json.dumps(data).encode()
+            req = Request(
+                f"http://127.0.0.1:{port}{path}",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            return json.loads(urlopen(req, timeout=5).read())
+        except Exception:
+            time.sleep(0.3)
+    return None
 
 
 def wait_for_server(port, timeout=10):
@@ -100,25 +104,50 @@ def block_hash(content, prev_hash):
 # -- Node helpers --------------------------------------------------------------
 
 def kill_port(port):
-    """Kill any process currently listening on this TCP port (Linux/macOS)."""
-    subprocess.run(
-        ["fuser", "-k", f"{port}/tcp"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    """Kill any process currently listening on this TCP port (cross-platform)."""
+    if sys.platform == "win32":
+        # netstat -ano lists PID; find lines with the target port in LISTENING state
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True,
+            text=True,
+        )
+        for line in result.stdout.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                parts = line.split()
+                pid = parts[-1]
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", pid],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+    else:
+        subprocess.run(
+            ["fuser", "-k", f"{port}/tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     time.sleep(0.3)
 
 
 def start_node(port):
     kill_port(port)
     p = subprocess.Popen(
-        [sys.executable, "node.py", str(port), "127.0.0.1", "nonexistent.json"],
+        [sys.executable, "node.py", str(port), "127.0.0.1", "nonexistent.json", "--no-loop"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     procs[port] = p
     if not wait_for_server(port):
         print(f"  ⚠  node :{port} did not respond within 10s")
+
+
+def trigger_sync(rounds=1):
+    """Trigger one full sync+consensus cycle on all nodes."""
+    for _ in range(rounds):
+        for port in PORTS:
+            http_post(port, "/sync", {})
+        time.sleep(0.5)
 
 
 def stop_all():
@@ -173,7 +202,9 @@ def mine_block(port, prev_hash=None):
     content = {"transactions": mempool, "timestamp": int(time.time())}
     h = block_hash(content, prev_hash)
     r = http_post(port, "/block", {"hash": h, "content": content, "prev_hash": prev_hash})
-    return h, r
+    if r == 1:
+        return h, r
+    return None, r
 
 
 # -- Reporting -----------------------------------------------------------------
@@ -313,7 +344,7 @@ else:
 input("\n  [Enter] Wait for tie-break consensus round →")
 
 section("STEP 2b — After consensus round")
-wait_msg(7)
+trigger_sync(rounds=2)
 print_chains_compact()
 
 adopted_tip = (http_get(PORTS[0], "/getblocks") or [""])[-1]
@@ -324,13 +355,7 @@ if all_agree() and adopted_tip == winning_tip:
 elif all_agree():
     result_pass(f"Nodes agree (tip={adopted_tip[:16]}…)")
 else:
-    print("    Nodes still disagree, waiting 7s more...")
-    time.sleep(7)
-    print_chains_compact()
-    if all_agree():
-        result_pass("Tie-break resolved (needed extra time)")
-    else:
-        result_fail("Still disagreeing")
+    result_fail("Still disagreeing after 2 sync rounds")
 
 input("\n  [Enter] Grow one chain longer (Part 3) →")
 
@@ -347,7 +372,9 @@ print("""
 """)
 
 section("S1 mines block 2")
-h_t4, t4, r = send_tx(PORTS[0], "S1", "S2", 99)
+h_t4, t4 = make_tx("S1", "S2", 99)
+for port in PORTS:
+    store_local(port, h_t4, t4)  # T4 in all mempools before mining
 print(f"    New tx: S1→S2, 99 coins")
 bh_new, r = mine_block(PORTS[0])
 if bh_new:
@@ -359,7 +386,7 @@ section("Chain state — S1 ahead, others behind")
 print_chains_compact()
 
 section("After consensus round")
-wait_msg(7)
+trigger_sync(rounds=2)
 print_chains_compact()
 
 if all_agree():
@@ -368,13 +395,7 @@ if all_agree():
     result_pass(f"All nodes agree — adopted S1's chain (height=2, tip={tip}…)")
     print("    Mechanism: S1 has height=2 > others' height=1 → sync")
 else:
-    print("    Waiting 7s more...")
-    time.sleep(7)
-    print_chains_compact()
-    if all_agree():
-        result_pass("All nodes agree now")
-    else:
-        result_fail("Still disagreeing")
+    result_fail("Still disagreeing after 20s")
 
 input("\n  [Enter] Consensus failure under load (Part 4) →")
 
