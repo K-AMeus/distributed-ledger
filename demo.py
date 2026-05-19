@@ -9,6 +9,10 @@ PART 4 -- Rapid concurrent mining: consensus cannot keep up
 Run:
     python demo.py
 """
+MINING_ROUNDS = 5
+MINE_INTERVAL = 0.5
+
+
 
 import hashlib
 import json
@@ -17,6 +21,9 @@ import sys
 import time
 import threading
 from urllib.request import urlopen, Request
+
+CONSENSUS_INTERVAL = 2
+consensus_stop = threading.Event()
 
 PORTS = [5001, 5002, 5003]
 NAMES = ["S1", "S2", "S3"]
@@ -169,12 +176,25 @@ def connect_all():
         for q in PORTS:
             if p != q:
                 add_peer(p, q)
+                
+def consensus_background():
+    while not consensus_stop.is_set():
+        for port in PORTS:
+            http_post(port, "/sync", {})
+        consensus_stop.wait(CONSENSUS_INTERVAL)
+        print("\n  [Consensus round state]")
+        print_chains_compact()
 
 
 # -- Transaction / block helpers -----------------------------------------------
 
 def make_tx(sender, receiver, amount):
-    content = {"sender": sender, "receiver": receiver, "amount": amount}
+    content = {
+        "sender": sender,
+        "receiver": receiver,
+        "amount": amount,
+        "timestamp": time.time(),
+    }
     return tx_hash(content), content
 
 
@@ -371,6 +391,8 @@ print("""
   and all nodes adopt S1's chain.
 """)
 
+print_chains_compact()
+
 section("S1 mines block 2")
 h_t4, t4 = make_tx("S1", "S2", 99)
 for port in PORTS:
@@ -381,9 +403,6 @@ if bh_new:
     print(f"    S1 mined: {bh_new[:16]}…")
 else:
     print(f"    Mining failed: {r}")
-
-section("Chain state — S1 ahead, others behind")
-print_chains_compact()
 
 section("After consensus round")
 trigger_sync(rounds=2)
@@ -413,9 +432,6 @@ print("""
   → The system never stabilises.
 """)
 
-MINING_ROUNDS = 5
-MINE_INTERVAL = 0.5
-
 
 def _inject_and_mine(port, name, rnd, results):
     """Thread target: inject a unique tx into one node, then mine a block."""
@@ -431,6 +447,9 @@ print_chains_compact()
 
 disagree_rounds = []
 agree_rounds = []
+
+consensus_thread = threading.Thread(target=consensus_background, daemon=True)
+consensus_thread.start()
 
 for rnd in range(1, MINING_ROUNDS + 1):
     results = {}
@@ -481,6 +500,9 @@ for rnd in range(1, MINING_ROUNDS + 1):
 total = MINING_ROUNDS
 dis = len(disagree_rounds)
 agr = len(agree_rounds)
+
+consensus_stop.set()
+consensus_thread.join(timeout=1)
 
 section("Part 4 results")
 
