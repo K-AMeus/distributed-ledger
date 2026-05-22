@@ -377,6 +377,24 @@ elif all_agree():
 else:
     result_fail("Still disagreeing after 2 sync rounds")
 
+section("Mempools after tie-break — orphan-tx recovery")
+print_mempools()
+losers = [n for n in NAMES if n != winning_name]
+print(f"\n    {winning_name} won → its block stays canonical, its mempool stays empty.")
+print(f"    {', '.join(losers)} reorged → transactions from their orphaned blocks that")
+print(f"    are NOT in {winning_name}'s block are restored to the mempool so they can")
+print(f"    be mined into future blocks.")
+
+# At least one of the losing nodes should have its T3 restored
+restored_any = any(
+    len(http_get(PORTS[i], "/mempool") or []) > 0
+    for i, name in enumerate(NAMES) if name != winning_name
+)
+if restored_any:
+    result_pass("Orphaned transactions correctly returned to losing nodes' mempools")
+else:
+    result_fail("No transactions were restored — orphan recovery may be broken")
+
 input("\n  [Enter] Grow one chain longer (Part 3) →")
 
 # =============================================================================
